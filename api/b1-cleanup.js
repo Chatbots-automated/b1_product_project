@@ -1,60 +1,44 @@
-// Vercel Serverless Function (Node.js 18+)
+// Vercel Serverless Function (Node 18+)
 const axios = require("axios");
 
-// ---------- CONFIG ----------
-const B1_BASE_URL       = "https://www.b1.lt";
-const B1_API_KEY        = "YOUR_KEY_HERE";
-const B1_COMPANY_ID     = ""; // e.g. "123" if required
+// -------- CONFIG (edit these 2 if needed) ----------
+let B1_BASE_URL = "https://www.b1.lt"; // will auto-fallback to https://api.b1.lt if needed
+const B1_API_KEY = "a66da08c93a85ed160bcf819e69f458efb15b2ade976d605685852f4a1ef5b70";
+const COMPANY_ID = ""; // e.g. "123" if your tenant requires it, else leave ""
 const TARGET_GROUP_NAME = "xxx_pvz grupė";
-const DEFAULT_DRY_RUN   = false;
-// ------------------------------------------------------------
+const DEFAULT_DRY_RUN = false;
+// ---------------------------------------------------
 
 const HEADERS = {
   "Content-Type": "application/json; charset=utf-8",
-  "B1-Api-Key": B1_API_KEY,                   // ✅ correct header
-  ...(B1_COMPANY_ID ? { "X-Company-Id": B1_COMPANY_ID } : {}),
+  "B1-Api-Key": B1_API_KEY,              // <-- the only auth signal
+  ...(COMPANY_ID ? { "X-Company-Id": COMPANY_ID } : {}),
 };
 
-function withAuth(payload = {}) {
-  const p = { ...payload, apiKey: B1_API_KEY }; // also put apiKey in body (some endpoints require)
-  if (B1_COMPANY_ID) p.companyId = B1_COMPANY_ID;
-  return p;
-}
-
-const B1_PATHS = {
-  itemsList:  "/api/reference-book/items/list",
-  itemUpdate: "/api/reference-book/items/update",
-  groupsList: "/api/reference-book/item-groups/list",
-  groupCreate:"/api/reference-book/item-groups/create",
-  groupDelete:"/api/reference-book/item-groups/delete",
-};
-
-const SEPS = /[_\-/()[\].,:;]+/g;
-const baseWord = (s) => {
-  if (!s) return "";
-  s = String(s).trim().toLowerCase().normalize("NFKD").replace(/[\u0300-\u036f]/g, "");
-  const first = s.split(SEPS)[0] || s;
-  return first.replace(/[^a-z0-9]+/g, " ").trim();
-};
-
-async function b1Post(path, payload, retries = 3) {
-  const body = withAuth(payload);
-  for (let i = 0; i < retries; i++) {
+async function b1Post(path, payload, retries = 2) {
+  // do NOT inject apiKey into body; B1 wants the header
+  for (let i = 0; i <= retries; i++) {
     try {
-      const { data } = await axios.post(B1_BASE_URL + path, body, {
+      const { data } = await axios.post(B1_BASE_URL + path, payload, {
         headers: HEADERS,
         timeout: 60000,
-        validateStatus: () => true, // we'll inspect body ourselves
+        validateStatus: () => true,
       });
-      // B1 sometimes returns {code:400,...} with HTTP 200. Fail fast on business error:
-      if (data && typeof data === "object" && "code" in data && Number(data.code) >= 400) {
-        throw new Error(`B1 error ${data.code}: ${data.message || "Unknown"} (${JSON.stringify(data.errors || {})})`);
+      if (data && typeof data === "object" && Number(data.code) >= 400) {
+        // If API key is invalid from this host, try the api.* host once
+        const headerErr = JSON.stringify(data.errors || {});
+        const badKey = /raktas|api key|neteisingas|invalid/i.test(headerErr);
+        if (badKey && B1_BASE_URL === "https://www.b1.lt") {
+          B1_BASE_URL = "https://api.b1.lt"; // switch host once
+          continue; // retry the same request on api.* host
+        }
+        throw new Error(`B1 error ${data.code}: ${data.message} (${headerErr})`);
       }
       return data;
     } catch (err) {
-      const code = err?.response?.status;
-      if ([429, 500, 502, 503, 504].includes(code) && i < retries - 1) {
-        await new Promise((r) => setTimeout(r, 1500 * (i + 1)));
+      const status = err?.response?.status;
+      if ([429,500,502,503,504].includes(status) && i < retries) {
+        await new Promise(r => setTimeout(r, 1200*(i+1)));
         continue;
       }
       throw err;
@@ -62,173 +46,122 @@ async function b1Post(path, payload, retries = 3) {
   }
 }
 
-async function groupsListByNameContains(q, page = 1, rows = 500) {
-  const payload = { rows, page, sidx: "id", sord: "asc",
-    filters: { groupOp: "AND", rules: [{ field: "name", op: "cn", data: q }] },
-  };
-  const res = await b1Post(B1_PATHS.groupsList, payload);
-  return res?.rows || [];
-}
+// ---- minimal helpers (unchanged logic) ----
+const PATHS = {
+  itemsList:  "/api/reference-book/items/list",
+  itemUpdate: "/api/reference-book/items/update",
+  groupsList: "/api/reference-book/item-groups/list",
+  groupCreate:"/api/reference-book/item-groups/create",
+  groupDelete:"/api/reference-book/item-groups/delete",
+};
 async function listAllGroups() {
-  let page = 1, out = [];
+  const out = []; let page = 1;
   for (;;) {
-    const rows = await groupsListByNameContains("", page);
-    if (!rows?.length) break;
-    out = out.concat(rows);
-    page++;
+    const res = await b1Post(PATHS.groupsList, {
+      rows: 500, page, sidx: "id", sord: "asc",
+      filters: { groupOp: "AND", rules: [] },
+    });
+    const rows = res?.rows || [];
+    if (!rows.length) break;
+    out.push(...rows); page++;
   }
   return out;
 }
-async function ensureGroupByExactName(name, cacheByName, DRY_RUN) {
+async function ensureGroupByName(name, cache, dry) {
   const key = name.trim().toLowerCase();
-  if (cacheByName.has(key)) return cacheByName.get(key);
-
-  const hits = await groupsListByNameContains(name);
-  let grp = hits.find((g) => String(g.name || "").trim().toLowerCase() === key);
-  if (grp) { cacheByName.set(key, grp); return grp; }
-  if (DRY_RUN) return { id: -1, name };
-  const created = await b1Post(B1_PATHS.groupCreate, { name });
-  grp = { id: created.id, name };
-  cacheByName.set(key, grp);
-  return grp;
+  if (cache.has(key)) return cache.get(key);
+  const res = await b1Post(PATHS.groupsList, {
+    rows: 50, page: 1, sidx: "id", sord: "asc",
+    filters: { groupOp: "AND", rules: [{ field: "name", op: "cn", data: name }] },
+  });
+  let hit = (res?.rows||[]).find(g => String(g.name||"").trim().toLowerCase() === key);
+  if (hit) { cache.set(key, hit); return hit; }
+  if (dry) return { id: -1, name };
+  const created = await b1Post(PATHS.groupCreate, { name });
+  hit = { id: created.id, name };
+  cache.set(key, hit);
+  return hit;
 }
-
-// --- item read helpers (to verify updates) ---
-async function getItemById(id) {
-  const payload = { rows: 1, page: 1, sidx: "id", sord: "asc",
-    filters: { groupOp: "AND", rules: [{ field: "id", op: "eq", data: id }] },
-  };
-  const res = await b1Post(B1_PATHS.itemsList, payload);
-  return (res?.rows || [])[0] || null;
-}
-
-// --- update helpers with verification & fallbacks ---
-async function updateItemFields(itemId, fields, DRY_RUN) {
-  if (DRY_RUN) { console.log("[DRY] update", itemId, fields); return { dryRun: true }; }
-  const resp = await b1Post(B1_PATHS.itemUpdate, { id: itemId, ...fields });
-  console.log("update resp:", itemId, fields, JSON.stringify(resp));
+async function updateItem(id, fields, dry) {
+  if (dry) return { dryRun:true };
+  const resp = await b1Post(PATHS.itemUpdate, { id, ...fields });
   return resp;
 }
-
-async function moveItemToGroup(itemId, targetGroup, targetName, DRY_RUN) {
-  // Try by groupId first
-  await updateItemFields(itemId, { groupId: targetGroup.id }, DRY_RUN);
-  let after = await getItemById(itemId);
-  if (after && String(after.groupId || "").toString() === String(targetGroup.id)) return true;
-
-  // Fallback: try by group NAME (some tenants expect 'group' instead)
-  await updateItemFields(itemId, { group: targetName }, DRY_RUN);
-  after = await getItemById(itemId);
-  const ok = after && (String(after.group || "").trim().toLowerCase() === targetName.trim().toLowerCase()
-    || String(after.groupId || "").toString() === String(targetGroup.id));
-  if (!ok) console.warn("Move failed for", itemId, "after:", after);
-  return !!ok;
+async function getItemById(id) {
+  const res = await b1Post(PATHS.itemsList, {
+    rows: 1, page: 1, sidx: "id", sord: "asc",
+    filters: { groupOp:"AND", rules:[{ field:"id", op:"eq", data:id }] }
+  });
+  return (res?.rows||[])[0] || null;
 }
-
-async function clearItemCode(itemId, DRY_RUN) {
-  // Try code → itemCode → sku
-  const tries = [ {code:""}, {itemCode:""}, {sku:""} ];
-  for (const t of tries) {
-    await updateItemFields(itemId, t, DRY_RUN);
-    const after = await getItemById(itemId);
-    const nowEmpty = [after?.code, after?.itemCode, after?.sku].some(v => String(v||"").trim() === "");
-    if (nowEmpty) return true;
-  }
-  console.warn("Clear code failed for", itemId);
-  return false;
-}
-
-async function itemsListByGroupId(groupId, page = 1, rows = 500) {
-  const payload = { rows, page, sidx: "id", sord: "asc",
-    filters: { groupOp: "AND", rules: [{ field: "groupId", op: "eq", data: groupId }] },
-  };
-  const res = await b1Post(B1_PATHS.itemsList, payload);
-  return res?.rows || [];
-}
-async function deleteGroupById(groupId, DRY_RUN) {
-  if (DRY_RUN) { console.log("[DRY] delete group", groupId); return { dryRun: true }; }
-  const res = await b1Post(B1_PATHS.groupDelete, { id: groupId });
-  console.log("delete group resp:", groupId, JSON.stringify(res));
-  return res;
-}
+// --------------------------------------------
 
 module.exports = async (req, res) => {
   try {
     if (req.method !== "POST") return res.status(405).json({ error: "Use POST" });
 
-    const body  = typeof req.body === "string" ? JSON.parse(req.body) : req.body || {};
+    const body  = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
     const items = Array.isArray(body.items) ? body.items : [];
-    if (!items.length) return res.status(400).json({ error: "Body must include { items: [ ... ] }" });
+    if (!items.length) return res.status(400).json({ error: "Body must include { items: [...] }" });
 
     const DRY_RUN = body.dryRun ?? DEFAULT_DRY_RUN;
     const TARGET  = (body.targetGroupName || TARGET_GROUP_NAME).trim();
 
-    // 0) tiny auth sanity call
-    const sanity = await b1Post(B1_PATHS.itemsList, { rows:1, page:1, sidx:"id", sord:"asc", filters:{groupOp:"AND", rules:[]} });
-    if (!sanity || !("rows" in sanity)) throw new Error("Auth/List sanity failed");
-
-    // 1) ensure target group exists
-    const allGroups = await listAllGroups();
-    const cache = new Map(allGroups.map(g => [String(g.name||"").trim().toLowerCase(), g]));
-    const targetGroup = await ensureGroupByExactName(TARGET, cache, DRY_RUN);
-
-    // 2) filter: Pavadinimas starts with 'xxx'
-    const isXxx = (s) => String(s || "").trim().toLowerCase().startsWith("xxx");
-    const candidates = items.filter((it) => isXxx(it["Pavadinimas"]));
-
-    // 3) move + clear code with verification
-    const touchedKeys = new Set();
-    let movedOk = 0, codeClearedOk = 0;
-
-    const CHUNK = 100;
-    for (let i = 0; i < candidates.length; i += CHUNK) {
-      const chunk = candidates.slice(i, i + CHUNK);
-
-      for (const it of chunk) {
-        const name = it["Pavadinimas"] || "";
-        const orig = (it["Grupė"] || "").trim();
-        if (orig) touchedKeys.add(orig);
-        const bw = baseWord(name); if (bw) touchedKeys.add(bw);
-
-        const itemId = it["ID"];
-
-        const mOk = await moveItemToGroup(itemId, targetGroup, TARGET, DRY_RUN);
-        if (mOk) movedOk++;
-
-        const cOk = await clearItemCode(itemId, DRY_RUN);
-        if (cOk) codeClearedOk++;
-      }
+    // 0) sanity: prove auth on this host (auto-swaps to api.* if www.* rejects)
+    const sanity = await b1Post(PATHS.itemsList, {
+      rows: 1, page: 1, sidx: "id", sord: "asc",
+      filters: { groupOp:"AND", rules:[] }
+    });
+    if (!sanity || !("rows" in sanity)) {
+      return res.status(500).json({ error: "Auth/list sanity failed" });
     }
 
-    // 4) try deleting emptied groups (exact/fuzzy)
-    let groupsChecked = 0, groupsDeleted = 0;
-    for (const key of touchedKeys) {
-      const hits = await groupsListByNameContains(key);
-      if (!hits.length) continue;
+    // 1) ensure group
+    const allGroups = await listAllGroups();
+    const cache = new Map(allGroups.map(g => [String(g.name||"").trim().toLowerCase(), g]));
+    const targetGroup = await ensureGroupByName(TARGET, cache, DRY_RUN);
 
-      for (const g of hits) {
-        const gName = String(g.name || "").trim();
-        if (!gName || gName.toLowerCase() === TARGET.toLowerCase()) continue;
+    // 2) pick candidates
+    const isXxx = s => String(s||"").trim().toLowerCase().startsWith("xxx");
+    const candidates = items.filter(it => isXxx(it["Pavadinimas"]));
 
-        const still = await itemsListByGroupId(g.id);
-        groupsChecked++;
-        if (!still.length) { await deleteGroupById(g.id, DRY_RUN); groupsDeleted++; }
+    // 3) move & clear code (verify after)
+    let movedOk = 0, codeClearedOk = 0;
+    for (const it of candidates) {
+      const id = it["ID"];
+
+      // move by groupId
+      await updateItem(id, { groupId: targetGroup.id }, DRY_RUN);
+      let snap = await getItemById(id);
+      const moved = snap && String(snap.groupId||"") === String(targetGroup.id);
+      if (!moved) {
+        // fallback: by name
+        await updateItem(id, { group: TARGET }, DRY_RUN);
+        snap = await getItemById(id);
+      }
+      if (snap && (String(snap.groupId||"") === String(targetGroup.id) ||
+                   String(snap.group||"").trim().toLowerCase() === TARGET.toLowerCase())) movedOk++;
+
+      // clear code (try code -> itemCode -> sku)
+      for (const f of ["code","itemCode","sku"]) {
+        await updateItem(id, { [f]: "" }, DRY_RUN);
+        const after = await getItemById(id);
+        const empty = ["code","itemCode","sku"].every(k => String(after?.[k] ?? "").trim() === "");
+        if (empty) { codeClearedOk++; break; }
       }
     }
 
     res.status(200).json({
-      dryRun: !!DRY_RUN,
+      baseUrlUsed: B1_BASE_URL,
+      dryRun: DRY_RUN,
       targetGroup: TARGET,
       targetGroupId: targetGroup?.id,
       receivedItems: items.length,
       processedItems: candidates.length,
       movedOk,
-      codeClearedOk,
-      groupsChecked,
-      groupsDeleted
+      codeClearedOk
     });
   } catch (e) {
-    console.error("FATAL:", e?.response?.data || e);
-    res.status(500).json({ error: e?.response?.data || String(e) });
+    return res.status(500).json({ error: e?.message || String(e) });
   }
 };
