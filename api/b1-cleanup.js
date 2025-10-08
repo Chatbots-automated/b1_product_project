@@ -12,7 +12,7 @@ const DEFAULT_DRY_RUN   = true;
 // Important: B1 expects apiKey header/body, not Bearer auth
 const HEADERS = {
   "Content-Type": "application/json; charset=utf-8",
-  "apiKey": B1_API_KEY,            // <-- key in header
+  "B1-Api-Key": B1_API_KEY,            // <-- key in header
   ...(B1_COMPANY_ID ? { "X-Company-Id": B1_COMPANY_ID } : {}),
 };
 
