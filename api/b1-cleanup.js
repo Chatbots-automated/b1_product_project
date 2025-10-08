@@ -11,7 +11,7 @@ const DEFAULT_DRY_RUN   = true;  // change to false to commit by default
 
 const HEADERS = {
   "Content-Type": "application/json",
-  Authorization: `Bearer ${B1_API_KEY}`,
+  Authorization: `Bearer a66da08c93a85ed160bcf819e69f458efb15b2ade976d605685852f4a1ef5b70`,
   ...(B1_COMPANY_ID ? { "X-Company-Id": B1_COMPANY_ID } : {}),
 };
 
