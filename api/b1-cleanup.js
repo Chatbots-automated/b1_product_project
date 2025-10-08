@@ -3,7 +3,7 @@ const axios = require("axios");
 
 // ---------- CONFIG (hardcode your key if you like) ----------
 const B1_BASE_URL       = "https://www.b1.lt";
-const B1_API_KEY        = "PASTE_YOUR_B1_API_KEY_HERE";
+const B1_API_KEY        = "a66da08c93a85ed160bcf819e69f458efb15b2ade976d605685852f4a1ef5b70";
 const B1_COMPANY_ID     = ""; // optional
 const TARGET_GROUP_NAME = "xxx_pvz grupė";
 const DEFAULT_DRY_RUN   = true;  // change to false to commit by default
