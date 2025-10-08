@@ -1,19 +1,27 @@
 // Vercel Serverless Function (Node.js 18+)
 const axios = require("axios");
 
-// ---------- CONFIG (hardcode your key if you like) ----------
+// ---------- CONFIG ----------
 const B1_BASE_URL       = "https://www.b1.lt";
 const B1_API_KEY        = "a66da08c93a85ed160bcf819e69f458efb15b2ade976d605685852f4a1ef5b70";
-const B1_COMPANY_ID     = ""; // optional
+const B1_COMPANY_ID     = ""; // e.g. "123" if your tenant needs it; leave "" otherwise
 const TARGET_GROUP_NAME = "xxx_pvz grupė";
-const DEFAULT_DRY_RUN   = true;  // change to false to commit by default
+const DEFAULT_DRY_RUN   = true;
 // ------------------------------------------------------------
 
+// Important: B1 expects apiKey header/body, not Bearer auth
 const HEADERS = {
-  "Content-Type": "application/json",
-  Authorization: `Bearer a66da08c93a85ed160bcf819e69f458efb15b2ade976d605685852f4a1ef5b70`,
+  "Content-Type": "application/json; charset=utf-8",
+  "apiKey": B1_API_KEY,            // <-- key in header
   ...(B1_COMPANY_ID ? { "X-Company-Id": B1_COMPANY_ID } : {}),
 };
+
+// central helper to inject apiKey (+ companyId) into every payload
+function withAuth(payload = {}) {
+  const p = { ...payload, apiKey: B1_API_KEY };          // <-- key in body too (some endpoints require)
+  if (B1_COMPANY_ID) p.companyId = B1_COMPANY_ID;         // <-- add if your tenant needs it
+  return p;
+}
 
 const B1_PATHS = {
   itemsList:  "/api/reference-book/items/list",
@@ -33,9 +41,10 @@ const baseWord = (s) => {
 };
 
 async function b1Post(path, payload, retries = 3) {
+  const body = withAuth(payload);
   for (let i = 0; i < retries; i++) {
     try {
-      const { data } = await axios.post(B1_BASE_URL + path, payload, {
+      const { data } = await axios.post(B1_BASE_URL + path, body, {
         headers: HEADERS,
         timeout: 60000,
       });
@@ -130,15 +139,14 @@ module.exports = async (req, res) => {
     const isXxx = (s) => String(s || "").trim().toLowerCase().startsWith("xxx");
     const candidates = items.filter((it) => isXxx(it["Pavadinimas"]));
 
-    // 3) move + clear code (bulk, chunked + parallel)
-    const touchedKeys = new Set(); // original group names + base words
+    // 3) move + clear code
+    const touchedKeys = new Set();
     let moved = 0;
 
     const CHUNK = 200;
     for (let i = 0; i < candidates.length; i += CHUNK) {
       const chunk = candidates.slice(i, i + CHUNK);
 
-      // collect touched keys
       for (const it of chunk) {
         const name = it["Pavadinimas"] || "";
         const orig = (it["Grupė"] || "").trim();
@@ -147,7 +155,6 @@ module.exports = async (req, res) => {
         if (bw) touchedKeys.add(bw);
       }
 
-      // parallel updates (cap concurrency with Promise.allSettled on chunk)
       const tasks = [];
       for (const it of chunk) {
         const itemId = it["ID"];
@@ -156,10 +163,10 @@ module.exports = async (req, res) => {
       }
       const results = await Promise.allSettled(tasks);
       const ok = results.filter(r => r.status === "fulfilled").length;
-      moved += Math.floor(ok / 2); // two updates per item
+      moved += Math.floor(ok / 2);
     }
 
-    // 4) try deleting emptied groups
+    // 4) delete emptied groups
     let groupsChecked = 0;
     let groupsDeleted = 0;
 
@@ -167,7 +174,6 @@ module.exports = async (req, res) => {
       const hits = await groupsListByNameContains(key);
       if (!hits.length) continue;
 
-      // check each matched group; skip the target group
       for (const g of hits) {
         const gName = String(g.name || "").trim();
         if (!gName || gName.toLowerCase() === TARGET.toLowerCase()) continue;
